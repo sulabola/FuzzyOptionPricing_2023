@@ -1,0 +1,989 @@
+---
+title: "Option-Pricing"
+author: "Sulalitha Bowala"
+date: "2023-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+rm(list=ls(all=TRUE)) # Remove objects from environment
+set.seed(123)
+```
+
+
+```{r}
+library(tidyverse)
+library(quantmod)
+library(keras)
+library(dygraphs)
+library(xtable)
+library(glue)
+library(forcats)
+library(timetk)
+library(tidyquant)
+library(tibbletime)
+library(cowplot)
+library(recipes)
+library(rsample)
+library(yardstick)
+library(fGarch)
+library(prophet)
+library(rstan)
+#library(ptest)
+library(Jdmbs)
+library(writexl)
+#library(DiffusionRjgqd)
+library(magrittr)
+library(openxlsx)
+library(R2WinBUGS)
+library(tictoc)
+library(dplyr)
+library(tidyverse)
+library(xts)
+```
+
+
+### Read data from Excel files
+
+
+```{r}
+SPX <- read.xlsx("SPXdata.xlsx", startRow = 1, colNames = TRUE, rowNames = FALSE, detectDates = TRUE, skipEmptyRows = TRUE, skipEmptyCols = TRUE, rows = NULL, cols = NULL, na.strings = c("NA",""))
+
+SPX.div<-xts(as.numeric(SPX[,4]),order.by= as.Date(SPX$Date)) %>% na.omit()
+SPX.div <- log(SPX.div/100) %>% na.omit() #log div yield
+
+SPX.index<-xts(as.numeric(SPX[,2]),order.by= as.Date(SPX$Date)) %>% na.omit()
+SPX.r<-xts(as.numeric(SPX[,3]),order.by= as.Date(SPX$Date)) %>% na.omit()
+SPX.logr <- log(1+SPX.r)%>% na.omit() #log total return
+#SPX.log <- log(SPX) 
+time3 <-index(SPX)
+
+plot(SPX.logr,type='l',col='#222299',main='Log SP500 (SPX) Return', xlab = 'Time',ylab ='SP500',lwd=1)
+plot(SPX.div,type='l',col='#222299',main='SP500 (SPX) Dividends', xlab = 'Time',ylab ='SP500',lwd=1)
+
+#Sample average daily c.c. dividend yield
+q <- mean(SPX.div)
+q*252 #annualized q
+
+
+#SPX option data
+SPX.opt <- read.xlsx("SPXoptiondata.xlsx", startRow = 1, colNames = TRUE, rowNames = FALSE, detectDates = TRUE, skipEmptyRows = TRUE, skipEmptyCols = TRUE, rows = NULL, cols = NULL, na.strings = c("NA",""))
+
+#Remove rows that contains all NA's
+SPX.opt0 <- SPX.opt[,-1]
+SPX.opt0[SPX.opt0 == "#N/A N.A."] <- NA
+
+SPX.opt <- data.frame(Date = SPX.opt[,1],SPX.opt0)
+
+#T bill data
+rf <- read.xlsx("Tbill.xlsx", startRow = 1, colNames = TRUE, rowNames = FALSE, detectDates = TRUE, skipEmptyRows = TRUE, skipEmptyCols = TRUE, rows = NULL, cols = NULL, na.strings = c("NA",""))
+r <- mean(rf[,2])/(252*100)
+```
+
+
+## Summary Statistics
+
+```{r}
+# calculate sign correlation rho
+rho.cal<-function(X){
+  rho.hat<-cor(sign(X-mean(X)), X-mean(X))
+  return(rho.hat)
+}
+```
+
+
+```{r}
+return_info = function(data){
+  data<-as.numeric(data)
+  mean <- mean(data)
+  sd <- sd(data)
+  signrho <- rho.cal(data)
+  skewness <- skewness(data) #mu_3/sigma^3
+  kurtosis <- kurtosis(data) #excess kurtosis mu_4/sigma^4 - 3
+  fun <- function (x) signrho*(x-1)*beta(x/2,1/2)-2*sqrt(x-2)
+  nu<- uniroot(fun, c(2, 100))$root
+  acf1<-acf(data, plot=FALSE)$acf[2]
+  acf2<-acf(abs(data), plot=FALSE)$acf[2] 
+  acf3<-acf(data^2, plot=FALSE)$acf[2]
+  return(c(Mean = mean, SD = sd, Skewness = skewness, Kurtosis = kurtosis, SignCorrelation = signrho, DF = nu, ACF = acf1, ACF_abs = acf2, ACF_square = acf3))
+}
+```
+
+
+```{r}
+ss <- return_info (SPX.logr)
+as.data.frame(ss)
+xtable(as.data.frame(ss), digits = 4)
+```
+
+
+```{r}
+observed.vol <- function(X){
+  X<-as.numeric(X)
+  X.cdf <- ecdf(X)
+  return(abs(X - mean(X))/(2*rho.cal(X)*sqrt(X.cdf(mean(X))*(1-X.cdf(mean(X))))))
+}
+```
+
+
+```{r}
+vol<-observed.vol(SPX.logr)
+plot(vol, type = "l", col = "blue", xlab = "Days (from 2010-01-04)", ylab = "Observed Volatility")
+```
+
+## New plot - 
+
+```{r}
+# library(ggplot2)
+# library(tidyverse)
+# library(lubridate)
+# 
+# SPXnew <- read.xlsx("SPXdata.xlsx", startRow = 1, colNames = TRUE, rowNames = FALSE, detectDates = TRUE, skipEmptyRows = TRUE, skipEmptyCols = TRUE, rows = NULL, cols = NULL, na.strings = c("NA",""))
+# SPXnew$Date <- mdy(SPXnew$Date)
+# SPXnew$ObsVol <- vol
+# 
+# ggplot(SPXnew , aes(x=Date)) + geom_line(aes(y = vol), color = "blue") + scale_x_date(breaks = seq.Date(from = as.Date("2010-01-04"),
+#                                  to = as.Date("2023-03-01"), by = "year"),
+#                labels = as.character(seq(2010, 2023, 1))) +
+#   labs(x="", y="Price in $")
+```
+
+
+
+```{r}
+Obs_vol_summary <- return_info (vol)
+as.data.frame(Obs_vol_summary)
+xtable(as.data.frame(Obs_vol_summary), digits = 4)
+```
+
+
+## Getting Estimates from Winbugs
+
+```{r}
+#Data
+SPX.ret <- as.vector(SPX.logr)
+n <- length(SPX.logr)
+
+tic()
+#setting up data, parameters, and initial values for Gibbs chains 
+SPX.data <- list ("n", "SPX.ret")
+SPX.inits1 <- list(mu=0.05,lambda=0.05,muJ=-.05,tauJ=0.5,tau=1)
+SPX.inits2 <- list(mu=0,lambda=0.1,muJ=0,tauJ=1,tau=0.5)
+SPX.inits <- list (SPX.inits1,SPX.inits2)
+SPX.par <- c("mu", "sigma", "lambda", "muJ", "sigmaJ") 
+SPX.sim <- bugs(SPX.data, SPX.inits, SPX.par, "JD.bug", bugs.directory= "C:/Users/sulal/Desktop/WinBUGS14", working.directory=getwd(), n.iter=9000, n.chains=2, n.thin = 1, debug=TRUE) 
+SPX.sim$summary
+toc()
+```
+
+
+## Parameter Values
+
+## MC Call and Put Option - JD
+
+
+```{r}
+call_put_mc_JD <- function(N, X, St, r, muQ, sigma, TTM, lambdaQ, muJQ, sigmaJ) {
+#N - number of simulation paths
+#X - strike price
+#St - initial stock price
+#r - risk free rate
+#muQ - risk-neutral drift of the stock
+#sigma - volatility
+#T - option maturity
+#lambdaQ - risk-neutral jump intensity (# of jumps per day) 
+#muJQ - risk-neutral mean jump size
+#sigmaJ - volatility of jump size
+
+ST <- rep(0,N)
+
+for (k in 1:N){
+tau <- c()
+R <- -log(runif(1))/lambdaQ
+if (R < TTM) {
+  tau[1] <- R
+  i <- 1
+  tt <- R
+    while (tt < TTM) {
+    R <- -log(runif(1))/lambdaQ
+    tt <- tau[i]+R
+    i <- i+1
+    tau[i]<-tt 
+    }
+  tau <- tau[1:(length(tau)-1)]
+l_tau <- length(tau)
+
+X1 <- log(St) + (muQ-sigma^2/2)*tau[1] + sigma*tau[1]^0.5*rnorm(1) #logprice before the 1st jump
+XX <- X1 + (muQ-sigma^2/2)*(tau[l_tau]-tau[1]) + sigma*sum(tau^0.5*rnorm(l_tau)) + 
+  sum(rnorm(l_tau,muJQ,sigmaJ)) #logprice at the last jump before T
+XT <- XX + (muQ-sigma^2/2)*(TTM-tau[l_tau]) + sigma*(TTM-tau[l_tau])^0.5*rnorm(1)
+} else {XT <- log(St) + (muQ-sigma^2/2)*TTM + sigma*TTM^0.5*rnorm(1)}
+
+ST[k] <- XT
+
+}
+
+# simulated call and put prices
+call_sim = mean(pmax(exp(ST)-X, 0))*exp(-r*TTM)          
+put_sim = mean(pmax(X-exp(ST), 0)*exp(-r*TTM)) 
+return(c(call_sim, put_sim))
+}
+```
+
+
+
+```{r}
+#Choose an option to value
+date.obs <- "2023-02-15"
+date.maturity <- "2023-06-16"
+opt <- as.numeric(SPX.opt[SPX.opt$Date == date.obs,3])
+colnames(SPX.opt)[3]
+St <- as.numeric(SPX.index[index(SPX.index) == date.obs])
+
+#Relevant option parameters
+N <- 10000
+X <- 4000
+
+#Parameters from Bayesian MCMC estimation
+sigma <- SPX.sim$mean$sigma
+TTM <- as.numeric(difftime(date.maturity,date.obs,units = "days"))
+thetaQ <- 0.78
+lambdaQ = SPX.sim$mean$lambda*(1-thetaQ) #assuming lambdaQ = lambdaP
+muJQ <- SPX.sim$mean$muJ
+sigmaJ <- SPX.sim$mean$sigmaJ
+
+#q nd r are computed from sample data above
+
+muQ <- r - q - lambdaQ*(exp(muJQ+sigmaJ^2/2)-1)
+
+call_put_mc_JD(N, X, St, r, muQ, sigma, TTM, lambdaQ, muJQ, sigmaJ)
+
+print("The actual call price on that date is")
+opt
+```
+
+
+## BS
+
+```{r}
+bs = function(X, P, r, sigma, T){
+	d1 = (log(P/X) + (r + 0.5*sigma^2)*(T))/(sigma*sqrt(T))
+	d2 = d1 - sigma*sqrt(T)
+	Call = P*pnorm(d1,mean=0,sd=1)-X*exp(-r*(T))*pnorm(d2,mean=0,sd=1)
+	Put = X*exp(-r*(T))*pnorm(-d2,mean=0,sd=1)-P*pnorm(-d1,mean=0,sd=1)
+	Delta.Call = pnorm(d1, mean = 0, sd = 1)
+	Delta.Put = Delta.Call - 1
+	Gamma = dnorm(d1, mean = 0, sd = 1)/(P*sigma*sqrt(T))
+	return(list(Call=Call,Put=Put,Delta.Call=Delta.Call,Delta.Put=Delta.Put,Gamma=Gamma))
+}
+```
+
+
+```{r}
+call_put_bs = bs(X = X, P = St, r = r, sigma = sigma, T = TTM)
+print(call_put_bs, digits = 4)
+```
+
+
+## MC Call & Put prices - normal
+
+```{r}
+call_put_mc_n <- function(nSim, X, P, r, sigma, T) {
+F = P*exp(r*T)     # futures price
+ysim = -0.5*sigma^2*T + sigma*sqrt(T)*rnorm(nSim,0,1) # sim returns, 
+F = F*exp(ysim)      # sim futures price
+call_sim = mean(pmax(F-X, 0)*exp(-r*T))          # simulated price
+put_sim = mean(pmax(X-F, 0)*exp(-r*T)) 
+return(c(call_sim, put_sim))
+}
+```
+
+
+```{r}
+call_put_n <- list()
+call_put_n [[1]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigma, T = TTM)
+
+xtable(matrix(unlist(call_put_n), nrow = 2))
+```
+
+
+## MC Call & Put prices - t
+
+```{r}
+call_put_mc_t <- function(nSim, X, P, r, sigma, T, df) {
+F = P*exp(r*T)     # futures price
+ysim = -0.5*sigma^2*T + sigma*sqrt(T)*rt(nSim,df=df) # sim returns, 
+F = F*exp(ysim)      # sim futures price
+fsim<-pmax(F-X, 0)*exp(-r*T)
+fsim <- fsim[fsim < mean(fsim)+50*sd(fsim)]  #50 and 100 remove outliers t
+call_sim = mean(fsim)          # simulated price
+put_sim = mean(pmax(X-F, 0)*exp(-r*T)) 
+return(c(call_sim, put_sim))
+}
+```
+
+
+```{r}
+call_put_t <- list()
+
+## df
+ss[6]
+
+call_put_t [[1]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigma, T = TTM, df = ss[6]) ## df calculated from sign correlation
+
+xtable(matrix(unlist(call_put_t), nrow = 2))
+```
+
+
+## fuzzy interval for option pricing with NVF
+
+## NVF
+
+```{r}
+## function to estimate by Neuro volatility forecasts  # problem: slow function
+
+neuro.vol <- function(data){ 
+  ptm<-proc.time()
+  X.cdf <- ecdf(data)
+  rho <- rho.cal(data)
+  mu <- mean(data)
+  vol <- abs(data - mu)/(2*rho*sqrt(X.cdf(mu)*(1-X.cdf(mu))))
+  #vol.nnet <- list()
+  vol.nnet <- forecast::nnetar(vol)
+  nn.vol.fore <- forecast::forecast(vol.nnet, PI = TRUE, h=1)
+  rmse <- sqrt(mean((nn.vol.fore$residuals)^2, na.rm=TRUE))
+  return(c(as.numeric(nn.vol.fore$mean), rmse, proc.time()-ptm))
+}
+```
+
+
+```{r}
+N_data <- nrow(SPX.logr)
+step <- 63 # step = 63 rolling NNVF volatility forecasts
+
+nnvf<-c()
+
+for(i in 1:step){
+  nnvf[[i]]<-neuro.vol(as.numeric(SPX.logr[i:(N_data-step+i)]))
+}
+
+nnvf.m <- as.data.frame(matrix(unlist(nnvf), nrow=length(nnvf), byrow=TRUE))[, 1:3]
+colnames (nnvf.m) <- c("NNVF", "ERROR", "TIME")
+
+head(nnvf.m, digits = 4)
+```
+
+
+```{r}
+sd<-NA
+for(i in 1:step){
+  sd[i]<-sd(as.numeric(SPX.logr[i:(N_data-step+i)]))
+}
+```
+
+
+```{r}
+temp<-tail(SPX.logr, 63)
+
+vol.data <-cbind(temp, nnvf.m$NNVF, sd)[, -1]   #temp(tail 63)dates
+
+colnames(vol.data)<-c("NNVF", "SD")
+```
+
+
+```{r}
+q_numbers <-apply (vol.data, 2, quantile, probs=c(0.05,.25,.75, 0.95)) #quantiles
+print(q_numbers[,1], digits = 4)
+```
+
+## alpha cuts
+
+```{r}
+alpha_cuts = function(a,alpha,m,n){
+  return(c(a[1]+alpha^{1/m}*(a[2]-a[1]), a[4]-alpha^{1/n}*(a[4]-a[3])))
+}
+```
+
+
+```{r}
+## change both m and n in alpha-cuts
+
+# m = 0.5, n = 0.5, 1, 2
+m1 = 0.5
+dataNVF11<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m1, n=0.5)
+dataNVF12<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m1, n=1)
+dataNVF13<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m1, n=2)
+
+dataNVF14<-cbind(matrix(dataNVF11,nrow = 11, ncol = 2), matrix(dataNVF12,nrow = 11, ncol = 2), matrix(dataNVF13,nrow = 11, ncol = 2)) #rows are for different alpha, column 1, 2 for n = 0.5, column 3, 4 for n = 1, column 5, 6 for n = 2
+
+xtable(dataNVF14, digits = 4)
+
+# m = 1, n = 0.5, 1, 2
+m2 = 1.0
+dataNVF21<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m2, n=0.5)
+dataNVF22<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m2, n=1)
+dataNVF23<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m2, n=2)
+
+dataNVF24<-cbind(matrix(dataNVF21,nrow = 11, ncol = 2), matrix(dataNVF22,nrow = 11, ncol = 2), matrix(dataNVF23,nrow = 11, ncol = 2)) #rows are for different alpha, column 1, 2 for n = 0.5, column 3, 4 for n = 1, column 5, 6 for n = 2
+
+xtable(dataNVF24, digits = 4)
+
+# m = 2, n = 0.5, 1, 2
+m3 = 2.0
+dataNVF31<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m3, n=0.5)
+dataNVF32<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m3, n=1)
+dataNVF33<-alpha_cuts(a=as.numeric(q_numbers[, 1]), alpha=seq(0,1,0.1), m = m3, n=2)
+
+dataNVF34<-cbind(matrix(dataNVF31,nrow = 11, ncol = 2), matrix(dataNVF32,nrow = 11, ncol = 2), matrix(dataNVF33,nrow = 11, ncol = 2)) #rows are for different alpha, column 1, 2 for n = 0.5, column 3, 4 for n = 1, column 5, 6 for n = 2
+
+xtable(dataNVF34, digits = 4)
+```
+
+
+## fuzzy interval - BS
+
+## m = 0.5
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF11 = dataNVF14[2,]         # annual volatility
+sigmaNVF12 = dataNVF14[4,]
+sigmaNVF13 = dataNVF14[6,]
+sigmaNVF14 = dataNVF14[8,]
+sigmaNVF15 = dataNVF14[10,]
+
+f1 = bs(X = X, P = St, r = r, sigma = sigmaNVF11, T = TTM)
+f2 = bs(X = X, P = St, r = r, sigma = sigmaNVF12, T = TTM)
+f3 = bs(X = X, P = St, r = r, sigma = sigmaNVF13, T = TTM)
+f4 = bs(X = X, P = St, r = r, sigma = sigmaNVF14, T = TTM)
+f5 = bs(X = X, P = St, r = r, sigma = sigmaNVF15, T = TTM)
+
+# alpha = 0.1
+xtable(t(as.matrix(f1$Call)), digits = 2)
+
+#alpha = 0.3
+xtable(t(as.matrix(f2$Call)), digits = 2)
+
+#alpha = 0.5
+xtable(t(as.matrix(f3$Call)), digits = 2)
+
+#alpha = 0.7
+xtable(t(as.matrix(f4$Call)), digits = 2)
+
+#alpha = 0.9
+xtable(t(as.matrix(f5$Call)), digits = 2)
+
+```
+
+
+## m = 1.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF21 = dataNVF24[2,]         # annual volatility
+sigmaNVF22 = dataNVF24[4,]
+sigmaNVF23 = dataNVF24[6,]
+sigmaNVF24 = dataNVF24[8,]
+sigmaNVF25 = dataNVF24[10,]
+
+f1 = bs(X = X, P = St, r = r, sigma = sigmaNVF21, T = TTM)
+f2 = bs(X = X, P = St, r = r, sigma = sigmaNVF22, T = TTM)
+f3 = bs(X = X, P = St, r = r, sigma = sigmaNVF23, T = TTM)
+f4 = bs(X = X, P = St, r = r, sigma = sigmaNVF24, T = TTM)
+f5 = bs(X = X, P = St, r = r, sigma = sigmaNVF25, T = TTM)
+
+# alpha = 0.1
+xtable(t(as.matrix(f1$Call)), digits = 2)
+
+#alpha = 0.3
+xtable(t(as.matrix(f2$Call)), digits = 2)
+
+#alpha = 0.5
+xtable(t(as.matrix(f3$Call)), digits = 2)
+
+#alpha = 0.7
+xtable(t(as.matrix(f4$Call)), digits = 2)
+
+#alpha = 0.9
+xtable(t(as.matrix(f5$Call)), digits = 2)
+
+```
+
+
+## m = 2.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF31 = dataNVF34[2,]         # annual volatility
+sigmaNVF32 = dataNVF34[4,]
+sigmaNVF33 = dataNVF34[6,]
+sigmaNVF34 = dataNVF34[8,]
+sigmaNVF35 = dataNVF34[10,]
+
+f1 = bs(X = X, P = St, r = r, sigma = sigmaNVF31, T = TTM)
+f2 = bs(X = X, P = St, r = r, sigma = sigmaNVF32, T = TTM)
+f3 = bs(X = X, P = St, r = r, sigma = sigmaNVF33, T = TTM)
+f4 = bs(X = X, P = St, r = r, sigma = sigmaNVF34, T = TTM)
+f5 = bs(X = X, P = St, r = r, sigma = sigmaNVF35, T = TTM)
+
+# alpha = 0.1
+xtable(t(as.matrix(f1$Call)), digits = 2)
+
+#alpha = 0.3
+xtable(t(as.matrix(f2$Call)), digits = 2)
+
+#alpha = 0.5
+xtable(t(as.matrix(f3$Call)), digits = 2)
+
+#alpha = 0.7
+xtable(t(as.matrix(f4$Call)), digits = 2)
+
+#alpha = 0.9
+xtable(t(as.matrix(f5$Call)), digits = 2)
+
+```
+
+
+## fuzzy interval - normal
+
+## m = 0.5
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF11 = dataNVF14[2,]         # annual volatility
+sigmaNVF12 = dataNVF14[4,]
+sigmaNVF13 = dataNVF14[6,]
+sigmaNVF14 = dataNVF14[8,]
+sigmaNVF15 = dataNVF14[10,]
+
+ff1 <- list()
+ff2 <- list()
+ff3 <- list()
+ff4 <- list()
+ff5 <- list()
+
+for(i in 1:6){
+ff1 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF11[i], T = TTM)
+ff2 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF12[i], T = TTM)
+ff3 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF13[i], T = TTM)
+ff4 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF14[i], T = TTM)
+ff5 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF15[i], T = TTM)
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(ff1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(ff2), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(ff3), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(ff4), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(ff5), nrow = 2))
+
+```
+
+
+## m = 1.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF21 = dataNVF24[2,]         # annual volatility
+sigmaNVF22 = dataNVF24[4,]
+sigmaNVF23 = dataNVF24[6,]
+sigmaNVF24 = dataNVF24[8,]
+sigmaNVF25 = dataNVF24[10,]
+
+ff1 <- list()
+ff2 <- list()
+ff3 <- list()
+ff4 <- list()
+ff5 <- list()
+
+for(i in 1:6){
+ff1 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF21[i], T = TTM)
+ff2 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF22[i], T = TTM)
+ff3 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF23[i], T = TTM)
+ff4 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF24[i], T = TTM)
+ff5 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF25[i], T = TTM)
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(ff1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(ff2), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(ff3), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(ff4), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(ff5), nrow = 2))
+
+```
+
+
+## m = 2.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF31 = dataNVF34[2,]         # annual volatility
+sigmaNVF32 = dataNVF34[4,]
+sigmaNVF33 = dataNVF34[6,]
+sigmaNVF34 = dataNVF34[8,]
+sigmaNVF35 = dataNVF34[10,]
+
+ff1 <- list()
+ff2 <- list()
+ff3 <- list()
+ff4 <- list()
+ff5 <- list()
+
+for(i in 1:6){
+ff1 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF31[i], T = TTM)
+ff2 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF32[i], T = TTM)
+ff3 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF33[i], T = TTM)
+ff4 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF34[i], T = TTM)
+ff5 [[i]] <- call_put_mc_n (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF35[i], T = TTM)
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(ff1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(ff2), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(ff3), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(ff4), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(ff5), nrow = 2))
+
+```
+
+
+
+## fuzzy interval - t
+
+## m = 0.5
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF11 = dataNVF14[2,]         # annual volatility
+sigmaNVF12 = dataNVF14[4,]
+sigmaNVF13 = dataNVF14[6,]
+sigmaNVF14 = dataNVF14[8,]
+sigmaNVF15 = dataNVF14[10,]
+
+ff1 <- list()
+ff2 <- list()
+ff3 <- list()
+ff4 <- list()
+ff5 <- list()
+
+for(i in 1:6){
+ff1 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF11[i], T = TTM, df = ss[6])
+ff2 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF12[i], T = TTM, df = ss[6])
+ff3 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF13[i], T = TTM, df = ss[6])
+ff4 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF14[i], T = TTM, df = ss[6])
+ff5 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF15[i], T = TTM, df = ss[6])
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(ff1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(ff2), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(ff3), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(ff4), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(ff5), nrow = 2))
+
+```
+
+## m = 1.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF21 = dataNVF24[2,]         # annual volatility
+sigmaNVF22 = dataNVF24[4,]
+sigmaNVF23 = dataNVF24[6,]
+sigmaNVF24 = dataNVF24[8,]
+sigmaNVF25 = dataNVF24[10,]
+
+ff1 <- list()
+ff2 <- list()
+ff3 <- list()
+ff4 <- list()
+ff5 <- list()
+
+for(i in 1:6){
+ff1 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF21[i], T = TTM, df = ss[6])
+ff2 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF22[i], T = TTM, df = ss[6])
+ff3 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF23[i], T = TTM, df = ss[6])
+ff4 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF24[i], T = TTM, df = ss[6])
+ff5 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF25[i], T = TTM, df = ss[6])
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(ff1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(ff2), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(ff3), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(ff4), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(ff5), nrow = 2))
+
+```
+
+
+## m = 2.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF31 = dataNVF34[2,]         # annual volatility
+sigmaNVF32 = dataNVF34[4,]
+sigmaNVF33 = dataNVF34[6,]
+sigmaNVF34 = dataNVF34[8,]
+sigmaNVF35 = dataNVF34[10,]
+
+ff1 <- list()
+ff2 <- list()
+ff3 <- list()
+ff4 <- list()
+ff5 <- list()
+
+for(i in 1:6){
+ff1 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF31[i], T = TTM, df = ss[6])
+ff2 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF32[i], T = TTM, df = ss[6])
+ff3 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF33[i], T = TTM, df = ss[6])
+ff4 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF34[i], T = TTM, df = ss[6])
+ff5 [[i]] <- call_put_mc_t (nSim=N, X = X, P = St, r = r, sigma = sigmaNVF35[i], T = TTM, df = ss[6])
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(ff1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(ff2), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(ff3), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(ff4), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(ff5), nrow = 2))
+
+```
+
+
+
+## fuzzy interval - JD
+
+## m = 0.5
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF11 = dataNVF14[2,]         # annual volatility
+sigmaNVF12 = dataNVF14[4,]
+sigmaNVF13 = dataNVF14[6,]
+sigmaNVF14 = dataNVF14[8,]
+sigmaNVF15 = dataNVF14[10,]
+
+tempValue = length(sigmaNVF11)
+
+#For alpha = 0.1
+OP_JD_0.1 = list()
+for(i in 1:tempValue){
+  OP_JD_0.1[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF11[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.3
+OP_JD_0.3 = list()
+for(i in 1:tempValue){
+  OP_JD_0.3[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF12[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.5
+OP_JD_0.5 = list()
+for(i in 1:tempValue){
+  OP_JD_0.5[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF13[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.7
+OP_JD_0.7 = list()
+for(i in 1:tempValue){
+  OP_JD_0.7[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF14[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.9
+OP_JD_0.9 = list()
+for(i in 1:tempValue){
+  OP_JD_0.9[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF15[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(OP_JD_0.1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(OP_JD_0.3), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(OP_JD_0.5), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(OP_JD_0.7), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(OP_JD_0.9), nrow = 2))
+
+```
+
+
+## m = 1.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF21 = dataNVF24[2,]         # annual volatility
+sigmaNVF22 = dataNVF24[4,]
+sigmaNVF23 = dataNVF24[6,]
+sigmaNVF24 = dataNVF24[8,]
+sigmaNVF25 = dataNVF24[10,]
+
+#For alpha = 0.1
+OP_JD_0.1 = list()
+for(i in 1:tempValue){
+  OP_JD_0.1[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF21[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.3
+OP_JD_0.3 = list()
+for(i in 1:tempValue){
+  OP_JD_0.3[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF22[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.5
+OP_JD_0.5 = list()
+for(i in 1:tempValue){
+  OP_JD_0.5[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF23[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.7
+OP_JD_0.7 = list()
+for(i in 1:tempValue){
+  OP_JD_0.7[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF24[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.9
+OP_JD_0.9 = list()
+for(i in 1:tempValue){
+  OP_JD_0.9[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF25[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(OP_JD_0.1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(OP_JD_0.3), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(OP_JD_0.5), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(OP_JD_0.7), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(OP_JD_0.9), nrow = 2))
+
+```
+
+
+
+## m = 2.0
+
+```{r}
+## Consider alpha = 0.1,0.3,0.5,0.7,0.9
+sigmaNVF31 = dataNVF34[2,]         # annual volatility
+sigmaNVF32 = dataNVF34[4,]
+sigmaNVF33 = dataNVF34[6,]
+sigmaNVF34 = dataNVF34[8,]
+sigmaNVF35 = dataNVF34[10,]
+
+#For alpha = 0.1
+OP_JD_0.1 = list()
+for(i in 1:tempValue){
+  OP_JD_0.1[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF31[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.3
+OP_JD_0.3 = list()
+for(i in 1:tempValue){
+  OP_JD_0.3[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF32[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.5
+OP_JD_0.5 = list()
+for(i in 1:tempValue){
+  OP_JD_0.5[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF33[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.7
+OP_JD_0.7 = list()
+for(i in 1:tempValue){
+  OP_JD_0.7[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF34[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+#For alpha = 0.9
+OP_JD_0.9 = list()
+for(i in 1:tempValue){
+  OP_JD_0.9[[i]] = call_put_mc_JD(N = N, X = X, St = St, r = r, muQ = muQ, sigma = sigmaNVF35[i], T = TTM, lambdaQ = lambdaQ, muJQ = muJQ, sigmaJ = sigmaJ)
+}
+
+# alpha = 0.1
+xtable(matrix(unlist(OP_JD_0.1), nrow = 2))
+
+#alpha = 0.3
+xtable(matrix(unlist(OP_JD_0.3), nrow = 2))
+
+#alpha = 0.5
+xtable(matrix(unlist(OP_JD_0.5), nrow = 2))
+
+#alpha = 0.7
+xtable(matrix(unlist(OP_JD_0.7), nrow = 2))
+
+#alpha = 0.9
+xtable(matrix(unlist(OP_JD_0.9), nrow = 2))
+
+```
+
+
+
+
